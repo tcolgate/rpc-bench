@@ -17,5 +17,9 @@
 
 PROTOS := $(sort $(wildcard *.proto))
 
+PHONEY = certs
+certs:
+	CAROOT=. mkcert -cert-file server.crt -key-file server.key localhost 127.0.0.1
+
 all:
-	protoc --proto_path=. --gogofaster_out=plugins=grpc:. $(PROTOS)
+	protoc --proto_path=. --go_out=plugins=grpc:. $(PROTOS)

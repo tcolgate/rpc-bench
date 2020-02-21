@@ -19,9 +19,12 @@ package rpcbench
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -30,18 +33,27 @@ import (
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
-	"golang.org/x/net/context"
-	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
+var clientTLSConfig *tls.Config
+
 func init() {
 	grpc.EnableTracing = false
-}
 
-var clientTLSConfig = &tls.Config{
-	InsecureSkipVerify: true,
+	bs, err := ioutil.ReadFile("rootCA.pem")
+	if err != nil {
+		log.Fatalf("err: %v", err)
+	}
+
+	cp := x509.NewCertPool()
+	cp.AppendCertsFromPEM(bs)
+
+	clientTLSConfig = &tls.Config{
+		ServerName: "localhost",
+		RootCAs:    cp,
+	}
 }
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -60,13 +72,15 @@ func benchmarkEcho(b *testing.B, size int, accept func(net.Listener, *tls.Config
 		b.Fatal(err)
 	}
 
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp4", ":0")
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.VerifyClientCertIfGiven,
+		NextProtos:   []string{"h2"},
 	}
 
 	listener = tls.NewListener(listener, tlsConfig)
@@ -93,6 +107,7 @@ func benchmarkEcho(b *testing.B, size int, accept func(net.Listener, *tls.Config
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
+
 		runRequest := setupParallel()
 
 		for pb.Next() {
@@ -108,9 +123,17 @@ func benchmarkEcho(b *testing.B, size int, accept func(net.Listener, *tls.Config
 		teardown()
 	}
 
-	for err := range errChan {
-		if err != nil && !strings.HasSuffix(err.Error(), "use of closed network connection") {
-			b.Fatal(err)
+	for {
+		select {
+		case err, ok := <-errChan:
+			if !ok {
+				return
+			}
+			if err != nil && !strings.HasSuffix(err.Error(), "use of closed network connection") {
+				b.Fatal(err)
+			}
+		default:
+			return
 		}
 	}
 }
@@ -144,7 +167,12 @@ func benchmarkEchoGRPC(b *testing.B, listenAndServeFn func(net.Listener, *tls.Co
 	benchmarkEcho(b, size, listenAndServeFn,
 		func(addr net.Addr) {
 			var err error
-			conn, err = grpc.Dial(addr.String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLSConfig)), grpc.WithBlock())
+
+			_, port, err := net.SplitHostPort(addr.String())
+			if err != nil {
+				b.Fatal(err)
+			}
+			conn, err = grpc.Dial("localhost:"+port, grpc.WithTransportCredentials(credentials.NewTLS(clientTLSConfig)), grpc.WithBlock())
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -173,7 +201,8 @@ func benchmarkEchoStreamGRPC(b *testing.B, listenAndServeFn func(net.Listener, *
 	benchmarkEcho(b, size, listenAndServeFn,
 		func(addr net.Addr) {
 			var err error
-			conn, err = grpc.Dial(addr.String(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLSConfig)), grpc.WithBlock())
+			_, port, err := net.SplitHostPort(addr.String())
+			conn, err = grpc.Dial("localhost:"+port, grpc.WithTransportCredentials(credentials.NewTLS(clientTLSConfig)), grpc.WithBlock())
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -236,8 +265,6 @@ func listenAndServeGRPCServeHTTP(listener net.Listener, tlsConfig *tls.Config) e
 		TLSConfig: tlsConfig,
 		Handler:   grpcServer,
 	}
-
-	http2.ConfigureServer(&srv, nil)
 
 	return srv.Serve(listener)
 }
@@ -321,59 +348,6 @@ func BenchmarkGobRPC_64K(b *testing.B) {
 	benchmarkEchoGobRPC(b, 64<<10)
 }
 
-// proto-rpc
-
-func listenAndServeProtoRPC(listener net.Listener, _ *tls.Config) error {
-	rpcServer := rpc.NewServer()
-	if err := rpcServer.Register(new(Echo)); err != nil {
-		return err
-	}
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			return err
-		}
-
-		go ServeConn(conn)
-	}
-}
-
-func benchmarkEchoProtoRPC(b *testing.B, size int) {
-	var client *rpc.Client
-	benchmarkEcho(b, size, listenAndServeProtoRPC,
-		func(addr net.Addr) {
-			conn, err := tls.Dial(addr.Network(), addr.String(), clientTLSConfig)
-			if err != nil {
-				b.Fatal(err)
-			}
-			client = NewClient(conn)
-		},
-		func() {
-			if err := client.Close(); err != nil {
-				b.Fatal(err)
-			}
-		},
-		func() func(string) string {
-			return func(echoMsg string) string {
-				args := EchoRequest{Msg: echoMsg}
-				var reply EchoResponse
-				if err := client.Call("Echo.Echo", &args, &reply); err != nil {
-					b.Fatal(err)
-				}
-				return reply.Msg
-			}
-		},
-	)
-}
-
-func BenchmarkProtoRPC_1K(b *testing.B) {
-	benchmarkEchoProtoRPC(b, 1<<10)
-}
-
-func BenchmarkProtoRPC_64K(b *testing.B) {
-	benchmarkEchoProtoRPC(b, 64<<10)
-}
-
 // proto-http
 
 const (
@@ -409,8 +383,6 @@ func listenAndServeProtoHTTP(listener net.Listener, tlsConfig *tls.Config) error
 			w.Write(respBody)
 		}),
 	}
-
-	http2.ConfigureServer(&srv, nil)
 
 	return srv.Serve(listener)
 }
@@ -470,7 +442,7 @@ func BenchmarkProtoHTTP1_64K(b *testing.B) {
 }
 
 func benchmarkEchoProtoHTTP2(b *testing.B, size int) {
-	benchmarkEchoProtoHTTP(b, size, listenAndServeProtoHTTP, &http2.Transport{
+	benchmarkEchoProtoHTTP(b, size, listenAndServeProtoHTTP, &http.Transport{
 		TLSClientConfig: clientTLSConfig,
 	})
 }
